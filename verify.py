@@ -86,6 +86,53 @@ AMBIGUOUS_SAMPLE = {
 }
 
 
+# Eight zero-mismatch anchor reads (four perfect 0-reads and four perfect
+# 1-reads, all with max_mismatches=0) cover loci 0..7 and pin the canonical
+# pair uniquely to 00000000 / 11111111.  The ninth read X covers loci 0..2 and
+# exercises each side-feasibility category; the tenth read is a zero-budget
+# 0-read on 4..5.
+_ANCHOR_READS = [
+    _read([0, 1, 2], "000", limit=0),
+    _read([3, 4, 5, 6], "0000", limit=0),
+    _read([6, 7], "00", limit=0),
+    _read([2, 3, 4], "000", limit=0),
+    _read([0, 1, 2], "111", limit=0),
+    _read([3, 4, 5, 6], "1111", limit=0),
+    _read([5, 6, 7], "111", limit=0),
+    _read([0, 1], "11", limit=0),
+]
+
+
+def _budget_sample(x_read):
+    return {
+        "loci": 8,
+        "reads": _ANCHOR_READS + [x_read, _read([4, 5], "00", limit=0)],
+    }
+
+
+# Regression for the one-side-exceeds-budget bug: X = 110 with costs
+# [1,1,100] and a one-mismatch budget.  Group 0 (000) needs two cheap
+# mismatches (cost 2 but illegal); group 1 (111) needs one costly mismatch at
+# locus 2 (cost 100, legal) -- the valid global optimum used to be rejected
+# with MISMATCH_BUDGET_EXCEEDED.
+ONE_SIDED_BUDGET_SAMPLE = _budget_sample(
+    _read([0, 1, 2], "110", costs=[1, 1, 100], limit=1))
+
+# Both sides are within X's budget.  Group 0 costs 5 with one mismatch, group 1
+# costs 2 with two mismatches: total cost wins even at the larger count.
+BOTH_SIDES_SAMPLE = _budget_sample(
+    _read([0, 1, 2], "010", costs=[1, 5, 1], limit=3))
+
+# Equal cost (4) but one mismatch on group 0 vs two on group 1: the second
+# objective (maximum per-read mismatch count) breaks the tie.
+EQUAL_COST_SAMPLE = _budget_sample(
+    _read([0, 1, 2], "010", costs=[3, 4, 1], limit=2))
+
+# Neither side fits a zero-mismatch budget: the budget error must survive.
+NEITHER_SIDE_SAMPLE = _budget_sample(
+    _read([0, 1, 2], "010", limit=0))
+
+
 def _gapped_sample():
     payload = json.loads(json.dumps(MISMATCH_SAMPLE))
     payload["reads"][0] = _read([0, 2], "00")
@@ -166,6 +213,66 @@ def run_smoke(base_url):
         )
     results.append(_check("unique optimum, cost 1, one mismatch at locus 1",
                           ok, f"status={status} body={body if status != 200 else body.get('objective')}"))
+
+    print("- expensive side is the only within-budget choice")
+    status, body = _request(base_url, "/api/phase", ONE_SIDED_BUDGET_SAMPLE)
+    ok = False
+    if status == 200:
+        sol = body["solutions"][0]
+        x = sol["assignments"][8]
+        ok = (
+            body["status"] == "unique"
+            and body["objective"]["total_mismatch_cost"] == 100
+            and body["objective"]["max_mismatches_per_read"] == 1
+            and sol["haplotypes"] == {"group_0": "00000000",
+                                      "group_1": "11111111"}
+            and [a["group"] for a in sol["assignments"]] ==
+            [0, 0, 0, 0, 1, 1, 1, 1, 1, 0]
+            and sol["group_sizes"] == [5, 5]
+            and x["group"] == 1 and x["mismatch_count"] == 1
+            and x["mismatch_cost"] == 100
+            and x["mismatches"] == [
+                {"position": 2, "observed": "0", "expected": "1", "cost": 100}]
+        )
+    results.append(_check("unique optimum via costly side, cost 100 at locus 2",
+                          ok, f"status={status} body={body if status != 200 else body.get('objective')}"))
+
+    print("- both sides feasible: total cost decides first")
+    status, body = _request(base_url, "/api/phase", BOTH_SIDES_SAMPLE)
+    ok = False
+    if status == 200:
+        x = body["solutions"][0]["assignments"][8]
+        ok = (
+            body["status"] == "unique"
+            and body["objective"] == {"total_mismatch_cost": 2,
+                                      "max_mismatches_per_read": 2}
+            and x["group"] == 1 and x["mismatch_count"] == 2
+            and x["mismatch_cost"] == 2
+        )
+    results.append(_check("cheaper side (cost 2, 2 mismatches) wins over cost 5, 1",
+                          ok, f"status={status}"))
+
+    print("- equal cost, different mismatch counts: threshold breaks the tie")
+    status, body = _request(base_url, "/api/phase", EQUAL_COST_SAMPLE)
+    ok = False
+    if status == 200:
+        x = body["solutions"][0]["assignments"][8]
+        ok = (
+            body["status"] == "unique"
+            and body["objective"] == {"total_mismatch_cost": 4,
+                                      "max_mismatches_per_read": 1}
+            and x["group"] == 0 and x["mismatch_count"] == 1
+            and x["mismatch_cost"] == 4
+        )
+    results.append(_check("equal cost 4 resolved to one mismatch",
+                          ok, f"status={status}"))
+
+    print("- neither side within budget keeps the budget error")
+    status, body = _request(base_url, "/api/phase", NEITHER_SIDE_SAMPLE)
+    results.append(_check("422 MISMATCH_BUDGET_EXCEEDED (neither side feasible)",
+                          status == 422
+                          and body.get("error", {}).get("code") == "MISMATCH_BUDGET_EXCEEDED",
+                          f"got {status} {body}"))
 
     print("- ambiguous sample (two distinct optima)")
     status, body = _request(base_url, "/api/phase", AMBIGUOUS_SAMPLE)

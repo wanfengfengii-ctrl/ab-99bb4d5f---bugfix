@@ -154,6 +154,145 @@ def test_brute_force_on_permissive_budget():
     assert result["objective"]["total_mismatch_cost"] == total
 
 
+# ---------------------------------------------------------------------------
+# Budget-on-either-side regressions
+#
+# Eight zero-budget anchor reads (four perfect 0-reads, four perfect 1-reads)
+# cover all eight loci and uniquely pin the canonical pair to
+# 00000000 / 11111111.  A ninth read X covers 0..2; its tenth companion is a
+# zero-budget 0-read on 4..5.  X exercises each side-feasibility category.
+# ---------------------------------------------------------------------------
+
+def _pread(positions, obs, costs=None, limit=None):
+    return {
+        "positions": list(positions),
+        "observations": obs,
+        "mismatch_costs": costs if costs is not None else [1] * len(positions),
+        "max_mismatches": len(positions) if limit is None else limit,
+    }
+
+
+def _budget_case_reads(x_read):
+    return [
+        _pread([0, 1, 2], "000", limit=0),
+        _pread([3, 4, 5, 6], "0000", limit=0),
+        _pread([6, 7], "00", limit=0),
+        _pread([2, 3, 4], "000", limit=0),
+        _pread([0, 1, 2], "111", limit=0),
+        _pread([3, 4, 5, 6], "1111", limit=0),
+        _pread([5, 6, 7], "111", limit=0),
+        _pread([0, 1], "11", limit=0),
+        x_read,
+        _pread([4, 5], "00", limit=0),
+    ]
+
+
+def test_expensive_side_is_only_budget_feasible_choice():
+    # X = 110 over [0,1,2], costs [1,1,100], at most 1 mismatch.
+    # Side 0 (000): 2 mismatches at cost 2 -- illegal.
+    # Side 1 (111): 1 mismatch at locus 2, cost 100 -- legal and unique.
+    payload = {
+        "loci": 8,
+        "reads": _budget_case_reads(
+            _pread([0, 1, 2], "110", costs=[1, 1, 100], limit=1)),
+    }
+    result = solve(payload)
+    sol = result["solutions"][0]
+    assert result["status"] == "unique"
+    assert result["objective"] == {"total_mismatch_cost": 100,
+                                   "max_mismatches_per_read": 1}
+    assert sol["haplotypes"] == {"group_0": "00000000",
+                                 "group_1": "11111111"}
+    assert [a["group"] for a in sol["assignments"]] == \
+        [0, 0, 0, 0, 1, 1, 1, 1, 1, 0]
+    assert sol["group_sizes"] == [5, 5]
+    x = sol["assignments"][8]
+    assert x["group"] == 1
+    assert x["mismatch_count"] == 1
+    assert x["mismatch_cost"] == 100
+    assert x["mismatches"] == [
+        {"position": 2, "observed": "0", "expected": "1", "cost": 100}]
+    assert x["within_mismatch_limit"] is True
+
+
+def test_both_sides_feasible_total_cost_decides():
+    # X = 010, costs [1,5,1].  Side 0: mismatches at 0,2 -> count 2, cost 2.
+    # Side 1: mismatch at 1 -> count 1, cost 5.  Total cost must win even
+    # with the larger per-read mismatch count.
+    payload = {
+        "loci": 8,
+        "reads": _budget_case_reads(
+            _pread([0, 1, 2], "010", costs=[1, 5, 1], limit=3)),
+    }
+    result = solve(payload)
+    sol = result["solutions"][0]
+    assert result["status"] == "unique"
+    assert result["objective"] == {"total_mismatch_cost": 2,
+                                   "max_mismatches_per_read": 2}
+    x = sol["assignments"][8]
+    assert x["group"] == 1 and x["mismatch_count"] == 2
+    assert x["mismatch_cost"] == 2
+
+
+def test_equal_cost_different_mismatch_count_threshold_decides():
+    # X = 010, costs [3,4,1].  Side 0: one mismatch at locus 1 -> cost 4.
+    # Side 1: mismatches at 0 and 2 -> cost 3+1 = 4.  Costs tie, so the
+    # second objective picks count 1 (side 0).
+    payload = {
+        "loci": 8,
+        "reads": _budget_case_reads(
+            _pread([0, 1, 2], "010", costs=[3, 4, 1], limit=2)),
+    }
+    result = solve(payload)
+    sol = result["solutions"][0]
+    assert result["status"] == "unique"
+    assert result["objective"] == {"total_mismatch_cost": 4,
+                                   "max_mismatches_per_read": 1}
+    x = sol["assignments"][8]
+    assert x["group"] == 0 and x["mismatch_count"] == 1
+    assert x["mismatch_cost"] == 4
+    assert x["mismatches"] == [
+        {"position": 1, "observed": "1", "expected": "0", "cost": 4}]
+
+
+def test_neither_side_feasible_still_budget_error():
+    # X = 010 with a zero-mismatch budget: neither 000 nor 111 matches.
+    payload = {
+        "loci": 8,
+        "reads": _budget_case_reads(
+            _pread([0, 1, 2], "010", limit=0)),
+    }
+    with pytest.raises(PhaseError) as exc:
+        solve(payload)
+    assert exc.value.code == "MISMATCH_BUDGET_EXCEEDED"
+
+
+def test_balance_can_require_paying_a_premium():
+    # Seven overlapping length-2 zero-budget 0-reads form a connected chain
+    # across loci 0..7, forcing the only budget-feasible canonical pair to be
+    # 00000000 / 11111111 with all eight anchors on side 0.  Two further reads
+    # match side 0 perfectly but may switch to side 1 within their budgets at
+    # a strictly positive premium; balance forces both switches.  The old
+    # cheapest-side-only model rejected such instances as balance failures.
+    reads = [
+        _pread([p, p + 1], "00", limit=0) for p in range(7)
+    ] + [
+        _pread([0, 1, 2], "000", limit=0),
+        _pread([3, 4, 5], "000", costs=[7, 7, 7], limit=3),
+        _pread([5, 6, 7], "000", costs=[9, 9, 9], limit=3),
+    ]
+    result = solve({"loci": 8, "reads": reads})
+    sol = result["solutions"][0]
+    assert result["status"] == "unique"
+    assert result["objective"] == {"total_mismatch_cost": 48,
+                                   "max_mismatches_per_read": 3}
+    assert sol["group_sizes"] == [8, 2]
+    for i in (8, 9):
+        ev = sol["assignments"][i]
+        assert ev["group"] == 1 and ev["mismatch_count"] == 3
+        assert ev["within_mismatch_limit"] is True
+
+
 @pytest.mark.parametrize("seed", range(12))
 def test_matches_brute_force_tight_budget(seed):
     # Limit each read to one mismatch: exercises budget-constrained feasibility

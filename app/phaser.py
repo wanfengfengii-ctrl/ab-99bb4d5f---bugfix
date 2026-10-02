@@ -14,12 +14,29 @@ Swapping the two homolog labels (H, a) <-> (~H, ~a) is the same solution, so
 haplotypes are normalised: the representative H0 has its two most significant
 bits (loci n-1 and n-2) equal to 0.
 
-Per (read, candidate) the cheaper side determines the read's minimum-cost
-choice.  For a threshold t on mismatch count the read is then in one of:
-  * infeasible: cheapest-side mismatch count > t;
-  * forced: exactly one side keeps the minimum cost (or, on an equal-cost tie,
-    the second side needs more than t mismatches);
-  * flexible: both sides keep the minimum cost and stay within t.
+Per (read, candidate) *both* sides are evaluated:
+  * A read is budget-feasible on a side if its mismatch count there is within
+    its 'max_mismatches' budget.  The cheapest side is never assumed feasible:
+    a read whose cheap side needs two mismatches but whose expensive side
+    needs one is perfectly feasible (at the higher cost) under a one-mismatch
+    budget.
+  * Reads start on their cheapest feasible side; moving a read to the other
+    feasible side costs a non-negative premium (zero when both sides tie).
+    Reads may be switched -- paying a premium when needed -- to reach the
+    required MIN_GROUP_SIZE reads on each homolog, and to minimise the maximum
+    per-read mismatch count once total cost is fixed.
+
+For a fixed candidate the minimum total cost of a balanced assignment (each
+homolog >= MIN_GROUP_SIZE reads) is the base cost plus the cheapest switch
+premiums needed in each direction; MIN_GROUP_SIZE is 2, so at most two
+premiums per direction are ever required.  The optimal mismatch threshold is
+found by scanning t = 0, 1, ... with the same vectorised calculation restricted
+to sides feasible within t mismatches.
+
+Optimal *assignments* for the (at most two) winning candidates are enumerated
+with a small suffix DP over reads (m <= 36): it returns the lexicographically
+smallest optimal assignment, decides whether another distinct optimal
+assignment exists, and if so returns its immediate lexicographic successor.
 
 Ties between full solutions are broken deterministically on
 (max mismatches, haplotype string lexicographic on locus order, assignment
@@ -29,25 +46,23 @@ are returned, which also gives the unique/ambiguous decision.
 
 from __future__ import annotations
 
-import math
 from typing import Any
 
 import numpy as np
-
 MIN_LOCI = 8
 MAX_LOCI = 18
 MIN_READS = 10
 MAX_READS = 36
 MAX_COST = 10**9
 MIN_GROUP_SIZE = 2
+INF = np.iinfo(np.int64).max
+
+# Sentinel "switch impossible" premium.  Every real total is at most
+# 36 reads * 18 loci * 10**9 < 10**12, so 10**15 is safely larger.
+BIG = 10**15
 
 # Candidate haplotypes are processed in chunks to bound peak memory.
 CHUNK = 8192
-
-# flex_kind codes
-FLEX_NEVER = 0       # one side is strictly cheaper: the read can never switch
-FLEX_SYMMETRIC = 1   # equal cost, equal mismatch count: free at c_forced
-FLEX_ASYMMETRIC = 2  # equal cost, unequal count: free only at the larger count
 
 
 class PhaseError(Exception):
@@ -192,18 +207,12 @@ def _build_arrays(n: int, reads: list[dict[str, Any]]):
 # ---------------------------------------------------------------------------
 
 def _candidate_columns(g: np.ndarray, obs, mask, costs, lengths):
-    """Evaluate a block of normalised candidate haplotypes.
+    """Mismatch counts and costs on both sides for a block of candidates.
 
     g encodes H0 on loci 0..n-3 as low bits; loci n-2 and n-1 are 0.
 
-    Returns per-(read, candidate) arrays describing the cheapest assignment:
-      grp_forced : side feasible at the smallest mismatch count
-      c_forced   : mismatch count on that side
-      c_flex     : mismatch count at which the other side becomes feasible
-                   while keeping the minimum cost (c_forced if symmetric,
-                   larger count if asymmetric, +inf if never flexible)
-      flex_kind  : FLEX_* code
-      cost_min   : minimum mismatch cost for the read
+    Returns cnt0/cnt1 (mismatch counts) and cost0/cost1 (mismatch costs) of
+    every read against H0 / H1, each with shape (m, B).
     """
     m, n = obs.shape
     B = g.shape[0]
@@ -220,66 +229,89 @@ def _candidate_columns(g: np.ndarray, obs, mask, costs, lengths):
     read_totals = (costs * mask).sum(axis=1)
     cnt1 = lengths[:, None] - cnt0
     cost1 = read_totals[:, None] - cost0
-
-    cheaper0 = cost0 < cost1
-    equal = cost0 == cost1
-    fewer0 = cnt0 < cnt1
-    fewer1 = cnt1 < cnt0
-
-    grp_forced = np.where(cheaper0 | (equal & fewer0), 0, 1)
-    c0_best = cheaper0 | (equal & ~fewer1)   # side 0 is (a) cheapest choice
-    c_forced = np.where(c0_best, cnt0, cnt1)
-    cost_min = np.minimum(cost0, cost1)
-
-    flex_kind = np.full((m, B), FLEX_NEVER, dtype=np.int64)
-    c_flex = np.full((m, B), np.iinfo(np.int64).max, dtype=np.int64)
-
-    sym = equal & (cnt0 == cnt1)
-    asym = equal & ~sym
-    flex_kind[sym] = FLEX_SYMMETRIC
-    c_flex[sym] = cnt0[sym]
-    flex_kind[asym] = FLEX_ASYMMETRIC
-    c_flex[asym] = np.maximum(cnt0, cnt1)[asym]
-
-    return grp_forced, c_forced, c_flex, flex_kind, cost_min
+    return cnt0, cnt1, cost0, cost1
 
 
-def _balance_possible(n0_forced, k_flex, m: int) -> np.ndarray:
-    """Can x flexible reads be put in group 0 so both groups have >= 2 reads?"""
-    x_lo = np.maximum(0, MIN_GROUP_SIZE - n0_forced)
-    x_hi = np.minimum(k_flex, m - MIN_GROUP_SIZE - n0_forced)
-    return x_lo <= x_hi
+def _block_eval(cost0, cost1, allow0, allow1, m: int):
+    """Min balanced assignment cost per candidate given allowed sides.
+
+    ``allow0`` / ``allow1`` mark which (read, candidate) sides may be used
+    (within the read's own budget, or additionally within a mismatch
+    threshold).  Per candidate:
+
+      * budget feasible iff every read has at least one allowed side;
+      * each read starts on its cheapest allowed side (ties -> side 0);
+      * balance requires moving need0 / need1 reads into group 0 / group 1;
+        only reads whose other side is also allowed can move, paying the cost
+        difference; the cheapest premiums win.
+
+    Returns budget_ok, balance_ok and the minimum balanced total per column
+    (INF where no balanced assignment exists).
+    """
+    budget_ok = (allow0 | allow1).all(axis=0)
+
+    choose0 = allow0 & (~allow1 | (cost0 <= cost1))
+    base_cost = np.where(choose0, cost0, cost1).sum(axis=0)
+    n0_base = choose0.sum(axis=0)
+    need0 = np.maximum(0, MIN_GROUP_SIZE - n0_base)
+    need1 = np.maximum(0, MIN_GROUP_SIZE - (m - n0_base))
+
+    # Premium of switching a read from its base side to the other one; reads
+    # whose other side is disallowed carry the BIG sentinel.
+    prem_to0 = np.where(~choose0 & allow0 & allow1, cost0 - cost1, BIG)
+    prem_to1 = np.where(choose0 & allow0 & allow1, cost1 - cost0, BIG)
+    avail0 = (prem_to0 < BIG).sum(axis=0)
+    avail1 = (prem_to1 < BIG).sum(axis=0)
+    sort0 = np.sort(prem_to0, axis=0)
+    sort1 = np.sort(prem_to1, axis=0)
+
+    # need0 / need1 are at most MIN_GROUP_SIZE (2).
+    extra0 = np.where(
+        need0 == 0, 0,
+        np.where(need0 == 1, sort0[0], sort0[0] + sort0[1]))
+    extra1 = np.where(
+        need1 == 0, 0,
+        np.where(need1 == 1, sort1[0], sort1[0] + sort1[1]))
+
+    balance_ok = (avail0 >= need0) & (avail1 >= need1)
+    total = np.where(budget_ok & balance_ok,
+                     base_cost + extra0 + extra1, INF)
+    return budget_ok, balance_ok, total
 
 
 def _scan_candidates(n, obs, mask, costs, limits, lengths):
-    """First pass: feasibility at each read's own budget and minimum cost."""
-    m = obs.shape[0]
+    """First pass: budget/balance feasibility and minimum cost per candidate.
+
+    budget_ok : every read has at least one side within its own mismatch budget
+    size_ok   : a balanced split exists at all (both sides physically usable,
+                budgets ignored).  With m >= 2 * MIN_GROUP_SIZE this holds for
+                every candidate, but it is tracked explicitly so the error
+                classification can tell a pure budget failure apart from a
+                joint failure.
+    feasible  : a balanced split exists using only budget-feasible sides
+    """
     P = 1 << (n - 2)
-    feasible = np.zeros(P, dtype=bool)
-    totals = np.full(P, np.iinfo(np.int64).max, dtype=np.int64)
+    totals = np.full(P, INF, dtype=np.int64)
     size_ok_all = np.zeros(P, dtype=bool)
     budget_ok_all = np.zeros(P, dtype=bool)
-
     lim = limits[:, None]
+    any_side = np.ones((obs.shape[0], 1), dtype=bool)
+
     for start in range(0, P, CHUNK):
-        g = np.arange(start, min(start + CHUNK, P), dtype=np.int64)
-        grp, c_forced, c_flex, flex_kind, cost_min = _candidate_columns(
-            g, obs, mask, costs, lengths)
+        idx = np.arange(start, min(start + CHUNK, P), dtype=np.int64)
+        cnt0, cnt1, cost0, cost1 = _candidate_columns(
+            idx, obs, mask, costs, lengths)
+        allow0 = cnt0 <= lim
+        allow1 = cnt1 <= lim
+        budget_ok, balance_ok, total = _block_eval(
+            cost0, cost1, allow0, allow1, obs.shape[0])
+        _, balance_any, _ = _block_eval(
+            cost0, cost1, any_side, any_side, obs.shape[0])
+        budget_ok_all[idx] = budget_ok
+        size_ok_all[idx] = balance_any
+        totals[idx] = total
 
-        budget_ok = (c_forced <= lim).all(axis=0)
-
-        flex = ((flex_kind == FLEX_SYMMETRIC) & (c_forced <= lim)) | \
-               ((flex_kind == FLEX_ASYMMETRIC) & (c_flex <= lim))
-        n0_forced = ((grp == 0) & ~flex).sum(axis=0)
-        k_flex = flex.sum(axis=0)
-        size_ok = _balance_possible(n0_forced, k_flex, m)
-
-        ok = budget_ok & size_ok
-        feasible[g] = ok
-        size_ok_all[g] = size_ok
-        budget_ok_all[g] = budget_ok
-        totals[g] = cost_min.sum(axis=0)
-
+    feasible = totals < INF
     return feasible, totals, size_ok_all, budget_ok_all
 
 
@@ -291,75 +323,135 @@ def _reverse_bits(g: np.ndarray, n: int) -> np.ndarray:
     return rev
 
 
-def _threshold_columns(indices, obs, mask, costs, lengths, m: int):
-    """Second pass: min feasible mismatch threshold t per candidate.
+def _threshold_scan(indices, obs, mask, costs, limits, lengths, min_total):
+    """Smallest feasible mismatch threshold per minimum-cost candidate.
 
-    Also returns the forced-group template / flexible flags at that threshold
-    (one column per candidate), ready for assignment enumeration.
+    A candidate keeps global minimum total ``min_total`` at threshold t iff
+    every read has a side within min(t, its budget) and the minimum balanced
+    cost over those sides still equals ``min_total``.  Fully vectorised over
+    candidates; t only ranges over read lengths (<= 18).
     """
-    g = indices.astype(np.int64)
-    grp, c_forced, c_flex, flex_kind, _ = _candidate_columns(
-        g, obs, mask, costs, lengths)
-    k = g.shape[0]
+    k = indices.shape[0]
     max_t = int(lengths.max())
+    lim = limits[:, None]
+    cnt0, cnt1, cost0, cost1 = _candidate_columns(
+        indices.astype(np.int64), obs, mask, costs, lengths)
 
     t_star = np.full(k, max_t + 1, dtype=np.int64)
     for t in range(max_t + 1):
-        infeasible = (c_forced > t).any(axis=0)
-        flex = (flex_kind != FLEX_NEVER) & (c_flex <= t)
-        n0_forced = ((grp == 0) & ~flex).sum(axis=0)
-        k_flex = flex.sum(axis=0)
-        ok = ~infeasible & _balance_possible(n0_forced, k_flex, m) & (t_star > max_t)
-        t_star[ok] = t
-        if bool((t_star <= max_t).all()):
+        pending = t_star > max_t
+        if not bool(pending.any()):
             break
-
-    # Recompute flex / forced templates exactly at t_star for each candidate.
-    tt = t_star[None, :]
-    flex = (flex_kind != FLEX_NEVER) & (c_flex <= tt)
-    forced = ~flex
-    return t_star, grp, forced, flex
+        allow0 = (cnt0 <= t) & (cnt0 <= lim)
+        allow1 = (cnt1 <= t) & (cnt1 <= lim)
+        _, _, total = _block_eval(cost0, cost1, allow0, allow1, obs.shape[0])
+        hit = pending & (total == min_total)
+        t_star[hit] = t
+    return t_star, cnt0, cnt1, cost0, cost1
 
 
 # ---------------------------------------------------------------------------
-# Deterministic enumeration of the first two distinct optimum assignments
+# Optimal-assignment enumeration for one winning candidate
 # ---------------------------------------------------------------------------
 
-def _ways(rem: int, lo: int, hi: int) -> int:
-    """Number of ways to choose x of rem flexible reads with lo <= x <= hi."""
-    lo = max(lo, 0)
-    hi = min(hi, rem)
-    if lo > hi:
-        return 0
-    return sum(math.comb(rem, x) for x in range(lo, hi + 1))
+def _enumerate_optimal(cnt0, cnt1, cost0, cost1, limits, m: int,
+                       t: int) -> tuple[tuple[int, ...], tuple[int, ...] | None, int]:
+    """Optimal assignments for one candidate at its optimal threshold t.
 
+    Suffix DP over reads: suffix[i][z] is the minimum cost of placing reads
+    i..m-1 with exactly z of them on side 0, using only sides with at most t
+    mismatches (and within each read's own budget).  Counts how many
+    assignments attain each suffix minimum (capped at 2).
 
-def _kth_assignment(template: list[int], flex_pos: list[int], n0_forced: int,
-                    m: int, rank: int) -> tuple[int, ...]:
-    """rank-th lexicographically smallest valid assignment (rank 1-based)."""
-    assign = list(template)
-    n0 = n0_forced
-    rem = len(flex_pos)
-    for fp in flex_pos:
-        rem -= 1
-        lo = MIN_GROUP_SIZE - n0                 # flex reads still placed as 0
-        hi = m - MIN_GROUP_SIZE - n0
-        w0 = _ways(rem, lo, hi)
-        if rank <= w0:
-            assign[fp] = 0
-        else:
-            rank -= w0
-            assign[fp] = 1
-            n0 += 1
-    return tuple(assign)
+    Returns (best assignment, second distinct assignment or None, number of
+    distinct optimal assignments capped at 2).
+    """
+    # Per-read feasible side costs (INF when the side is not allowed).
+    per_read = [
+        (int(cost0[i]) if (int(cnt0[i]) <= t
+                           and int(cnt0[i]) <= int(limits[i])) else INF,
+         int(cost1[i]) if (int(cnt1[i]) <= t
+                           and int(cnt1[i]) <= int(limits[i])) else INF)
+        for i in range(m)
+    ]
 
+    # suffix_cost[i][z], suffix_ways[i][z] (ways capped at 2).
+    sc = [[INF] * (m + 1) for _ in range(m + 1)]
+    sw = [[0] * (m + 1) for _ in range(m + 1)]
+    sc[m][0] = 0
+    sw[m][0] = 1
+    for i in range(m - 1, -1, -1):
+        a0, a1 = per_read[i]
+        for z in range(m - i + 1):
+            best = INF
+            ways = 0
+            if z > 0 and a0 < INF and sc[i + 1][z - 1] < INF:
+                best = a0 + sc[i + 1][z - 1]
+                ways = sw[i + 1][z - 1]
+            if a1 < INF and sc[i + 1][z] < INF:
+                v = a1 + sc[i + 1][z]
+                if v < best:
+                    best, ways = v, sw[i + 1][z]
+                elif v == best:
+                    ways = min(2, ways + sw[i + 1][z])
+            sc[i][z] = best
+            sw[i][z] = ways
 
-def _column_parts(grp_col, forced_col, flex_col) -> tuple[list[int], list[int], int]:
-    m = grp_col.shape[0]
-    template = [-1 if flex_col[i] else int(grp_col[i]) for i in range(m)]
-    flex_pos = [i for i in range(m) if flex_col[i]]
-    n0_forced = sum(1 for v in template if v == 0)
-    return template, flex_pos, n0_forced
+    best = min(sc[0][z] for z in range(MIN_GROUP_SIZE, m - MIN_GROUP_SIZE + 1))
+    total_ways = min(2, sum(
+        sw[0][z] for z in range(MIN_GROUP_SIZE, m - MIN_GROUP_SIZE + 1)
+        if sc[0][z] == best))
+
+    def suffix_min(i: int, zlo: int, zhi: int) -> int:
+        """Minimum suffix cost for reads i.. with zero-count in [zlo, zhi]."""
+        zlo = max(zlo, 0)
+        zhi = min(zhi, m - i)
+        if zlo > zhi:
+            return INF
+        return min(sc[i][z] for z in range(zlo, zhi + 1))
+
+    def can_choose(i: int, k: int, spent: int, side: int, best_total: int) -> bool:
+        """After choosing `side` for read i, can the rest still reach best?"""
+        k2 = k + (1 if side == 0 else 0)
+        rem = m - i - 1
+        zlo = MIN_GROUP_SIZE - k2
+        zhi = m - MIN_GROUP_SIZE - k2
+        add = per_read[i][side]
+        if add >= INF or spent + add > best_total:
+            return False
+        return suffix_min(i + 1, zlo, zhi) == best_total - spent - add
+
+    def lex_min_from(i: int, k: int, spent: int, prefix: list[int],
+                     best_total: int) -> tuple[int, ...]:
+        """Lexicographically smallest optimal completion from read i on."""
+        out = list(prefix)
+        for j in range(i, m):
+            picked = 0 if can_choose(j, k, spent, 0, best_total) else 1
+            out.append(picked)
+            spent += per_read[j][picked]
+            k += 1 if picked == 0 else 0
+        return tuple(out)
+
+    first = lex_min_from(0, 0, 0, [], best)
+
+    # Immediate lexicographic successor: rightmost 0 in `first` that can flip
+    # to 1 while still completing optimally; the suffix becomes lex-min.
+    second = None
+    second_state = None
+    k0 = 0
+    spent0 = 0
+    for i in range(m):
+        if first[i] == 0 and can_choose(i, k0, spent0, 1, best):
+            second_state = (i, k0, spent0)
+        k0 += 1 if first[i] == 0 else 0
+        spent0 += per_read[i][first[i]]
+    if total_ways >= 2 and second_state is not None:
+        i, k, spent = second_state
+        second = lex_min_from(
+            i + 1, k, spent + per_read[i][1],
+            list(first[:i]) + [1], best)
+
+    return first, second, total_ways
 
 
 # ---------------------------------------------------------------------------
@@ -416,7 +508,7 @@ def _format_solution(rank: int, g: int, assignment: tuple[int, ...], n: int,
 def _no_solution_reason(size_ok: np.ndarray, budget_ok: np.ndarray) -> tuple[str, str]:
     if not size_ok.any() and not budget_ok.any():
         return ("INFEASIBLE",
-                f"no candidate haplotype pair keeps every read within its "
+                "no candidate haplotype pair keeps every read within its "
                 "mismatch budget and admits at least "
                 f"{MIN_GROUP_SIZE} reads per homolog")
     if not budget_ok.any():
@@ -447,31 +539,32 @@ def solve(payload: Any) -> dict[str, Any]:
     best_total = int(totals[feasible].min())
     best_idx = np.nonzero(feasible & (totals == best_total))[0]
 
-    # Second objective: minimal maximum per-read mismatch count.
-    t_star, grp, forced, flex = _threshold_columns(
-        best_idx, obs, mask, costs, lengths, m)
+    # Second objective: minimal maximum per-read mismatch count among the
+    # minimum-cost balanced solutions.
+    t_star, cnt0, cnt1, cost0, cost1 = _threshold_scan(
+        best_idx, obs, mask, costs, limits, lengths, best_total)
     t_min = int(t_star.min())
     pool = best_idx[t_star == t_min]
     pool = pool[np.argsort(_reverse_bits(pool, n), kind="stable")]
 
+    def column_of(g: int) -> int:
+        return int(np.searchsorted(best_idx, g))
+
+    def enumerate_candidate(g: int):
+        col = column_of(g)
+        return _enumerate_optimal(
+            cnt0[:, col], cnt1[:, col], cost0[:, col], cost1[:, col],
+            limits, m, int(t_star[col]))
+
     g_a = int(pool[0])
-    col_a = int(np.searchsorted(best_idx, g_a))
-    template_a, flex_pos_a, n0_forced_a = _column_parts(
-        grp[:, col_a], forced[:, col_a], flex[:, col_a])
-    kf_a = len(flex_pos_a)
-    count_a = _ways(kf_a, MIN_GROUP_SIZE - n0_forced_a,
-                    m - MIN_GROUP_SIZE - n0_forced_a)
-    assign_a1 = _kth_assignment(template_a, flex_pos_a, n0_forced_a, m, 1)
+    assign_a1, assign_a2, ways_a = enumerate_candidate(g_a)
 
     second = None
-    if count_a >= 2:
-        second = (g_a, _kth_assignment(template_a, flex_pos_a, n0_forced_a, m, 2))
+    if assign_a2 is not None:
+        second = (g_a, assign_a2)
     elif pool.shape[0] > 1:
         g_b = int(pool[1])
-        col_b = int(np.searchsorted(best_idx, g_b))
-        template_b, flex_pos_b, n0_forced_b = _column_parts(
-            grp[:, col_b], forced[:, col_b], flex[:, col_b])
-        assign_b1 = _kth_assignment(template_b, flex_pos_b, n0_forced_b, m, 1)
+        assign_b1, _, _ = enumerate_candidate(g_b)
         second = (g_b, assign_b1)
 
     solutions = [_format_solution(1, g_a, assign_a1, n, reads, best_total, t_min)]
