@@ -154,6 +154,176 @@ def test_brute_force_on_permissive_budget():
     assert result["objective"]["total_mismatch_cost"] == total
 
 
+def make_tight_payload(rng, n=8, m=10, noise=0.12):
+    """Tight, skewed-cost instance: exercises budget-infeasible cheap sides.
+
+    Limits are 0-2 mismatches and individual costs are occasionally huge, so
+    the only within-budget side of a read need not be its cheapest side.
+    """
+    g_star = int(rng.integers(0, 1 << n))
+    reads = []
+    seen = set()
+    while len(reads) < m:
+        L = int(rng.integers(2, n + 1))
+        start = int(rng.integers(0, n - L + 1))
+        positions = list(range(start, start + L))
+        side = int(rng.integers(0, 2))
+        obs = "".join(
+            str(((g_star >> p) & 1) ^ side ^ (1 if rng.random() < noise else 0))
+            for p in positions)
+        if (tuple(positions), obs) in seen:
+            continue
+        seen.add((tuple(positions), obs))
+        costs = [int(rng.integers(1, 6)) if rng.random() > 0.3
+                 else int(rng.integers(50, 300)) for _ in positions]
+        reads.append({
+            "positions": positions,
+            "observations": obs,
+            "mismatch_costs": costs,
+            "max_mismatches": min(int(rng.integers(0, 3)), L),
+        })
+    return {"loci": n, "reads": reads}
+
+
+@pytest.mark.parametrize("seed", range(12))
+def test_matches_brute_force_tight_skewed_budget(seed):
+    # The within-budget side of a read may be strictly costlier than the
+    # cheapest side; optimum, uniqueness and ranking must stay oracle-exact.
+    rng = np.random.default_rng(2000 + seed)
+    payload = make_tight_payload(rng)
+    oracle = brute_force(payload)
+    if oracle is None:
+        with pytest.raises(PhaseError):
+            solve(payload)
+        return
+    (total, t), rows = oracle
+    result = solve(payload)
+    assert result["objective"]["total_mismatch_cost"] == total
+    assert result["objective"]["max_mismatches_per_read"] == t
+    rows.sort(key=lambda k: (k[2], k[3]))
+    sol = result["solutions"][0]
+    h0 = sol["haplotypes"]["group_0"]
+    a = tuple(x["group"] for x in sol["assignments"])
+    assert (h0, a) == (rows[0][2], rows[0][3])
+    if len(rows) == 1:
+        assert result["status"] == "unique"
+    else:
+        assert result["status"] == "ambiguous"
+        sol2 = result["solutions"][1]
+        h0b = sol2["haplotypes"]["group_0"]
+        ab = tuple(x["group"] for x in sol2["assignments"])
+        expected = min(rows[1:], key=lambda k: (k[2], k[3]))
+        assert (h0b, ab) == (expected[2], expected[3])
+
+
+def _pinned_pair_payload(read0, extra_zero=()):
+    """Zero-mismatch anchors pin the canonical pair to 00000000/11111111."""
+    def rr(ps, obs, limit=0, costs=None):
+        return {
+            "positions": list(ps),
+            "observations": obs,
+            "mismatch_costs": costs if costs is not None else [1] * len(ps),
+            "max_mismatches": limit,
+        }
+    reads = [
+        read0,
+        rr([0, 1, 2, 3], "0000"), rr([0, 1, 2, 3], "1111"),
+        rr([2, 3, 4, 5], "0000"), rr([2, 3, 4, 5], "1111"),
+        rr([3, 4, 5, 6, 7], "00000"), rr([3, 4, 5, 6, 7], "11111"),
+        rr([0, 1], "00"), rr([6, 7], "11"), rr([4, 5], "00"),
+    ]
+    return {"loci": 8, "reads": reads}
+
+
+def test_costlier_in_budget_side_is_selected():
+    # Cheap side (group 0) needs 2 mismatches against a limit of 1: illegal
+    # despite costing only 2.  The costlier side (100) is the unique
+    # within-budget choice and must form the global optimum.
+    read0 = {"positions": [0, 1, 2], "observations": "110",
+             "mismatch_costs": [1, 1, 100], "max_mismatches": 1}
+    payload = _pinned_pair_payload(read0)
+    result = solve(payload)
+
+    assert result["status"] == "unique"
+    assert result["objective"] == {"total_mismatch_cost": 100,
+                                   "max_mismatches_per_read": 1}
+    sol = result["solutions"][0]
+    assert sol["haplotypes"] == {"group_0": "00000000", "group_1": "11111111"}
+    assert [a["group"] for a in sol["assignments"]] == \
+        [1, 0, 1, 0, 1, 0, 1, 0, 1, 0]
+    assert sol["group_sizes"] == [5, 5]
+    ev0 = sol["assignments"][0]
+    assert ev0["group"] == 1
+    assert ev0["mismatch_count"] == 1
+    assert ev0["mismatch_cost"] == 100
+    assert ev0["within_mismatch_limit"] is True
+    assert ev0["mismatches"] == [
+        {"position": 2, "observed": "0", "expected": "1", "cost": 100}]
+    for ev in sol["assignments"]:
+        assert ev["mismatch_count"] <= ev["max_mismatches_allowed"]
+
+
+def test_equal_cost_different_mismatch_counts():
+    # Both sides of read 0 cost 2, but side 0 needs 1 mismatch (position 1,
+    # cost 2) and side 1 needs 2 (positions 0 and 2, costs 1+1); the
+    # secondary objective must prefer side 0.
+    read0 = {"positions": [0, 1, 2], "observations": "010",
+             "mismatch_costs": [1, 2, 1], "max_mismatches": 2}
+    payload = _pinned_pair_payload(read0)
+    result = solve(payload)
+    assert result["objective"]["total_mismatch_cost"] == 2
+    assert result["objective"]["max_mismatches_per_read"] == 1
+    ev0 = result["solutions"][0]["assignments"][0]
+    assert (ev0["group"], ev0["mismatch_count"], ev0["mismatch_cost"]) == (0, 1, 2)
+
+
+def test_neither_side_within_budget_still_errors():
+    # Observation 0101 differs from both complementary haplotypes on the
+    # covered interval, so no assignment keeps read 0 within a zero budget.
+    read0 = {"positions": [0, 1, 2, 3], "observations": "0101",
+             "mismatch_costs": [1, 1, 1, 1], "max_mismatches": 0}
+    payload = _pinned_pair_payload(read0)
+    with pytest.raises(PhaseError) as exc:
+        solve(payload)
+    assert exc.value.code == "MISMATCH_BUDGET_EXCEEDED"
+    assert brute_force(payload) is None
+
+
+def test_premium_side_required_for_group_balance():
+    # Both sides of every loose read are feasible and all of them are free
+    # only on group 0, while just one read is forced to group 1.  The balance
+    # constraint forces one read onto its strictly costlier side; the cheapest
+    # such premium (the length-2 read, cost 200) is the unique optimum.
+    def rr(ps, obs, limit, costs):
+        return {"positions": list(ps), "observations": obs,
+                "mismatch_costs": costs, "max_mismatches": limit}
+    payload = {"loci": 8, "reads": [
+        rr([0, 1, 2, 3], "0000", 0, [1, 1, 1, 1]),       # forced group 0
+        rr([2, 3, 4, 5], "0000", 0, [1, 1, 1, 1]),       # forced group 0
+        rr([3, 4, 5, 6, 7], "00000", 0, [1] * 5),        # forced group 0
+        rr([0, 1], "00", 0, [1, 1]),                     # forced group 0
+        rr([4, 5], "00", 0, [1, 1]),                     # forced group 0
+        rr([6, 7], "11", 0, [1, 1]),                     # forced group 1
+        rr([0, 1, 2], "000", 3, [100, 100, 100]),        # premium 300
+        rr([1, 2, 3], "000", 3, [100, 100, 100]),        # premium 300
+        rr([5, 6, 7], "000", 3, [100, 100, 100]),        # premium 300
+        rr([2, 3], "00", 3, [100, 100]),                 # premium 200 (cheapest)
+    ]}
+    result = solve(payload)
+    assert result["status"] == "unique"
+    assert result["objective"] == {"total_mismatch_cost": 200,
+                                   "max_mismatches_per_read": 2}
+    sol = result["solutions"][0]
+    assert sol["haplotypes"] == {"group_0": "00000000", "group_1": "11111111"}
+    assert sol["group_sizes"] == [8, 2]
+    moved = sol["assignments"][9]
+    assert (moved["group"], moved["mismatch_count"], moved["mismatch_cost"]) == (1, 2, 200)
+    for ev in sol["assignments"][:9]:
+        assert ev["group"] == (1 if ev["read_id"] == 5 else 0)
+    (total, t), rows = brute_force(payload)
+    assert (total, t) == (200, 2) and len(rows) == 1
+
+
 @pytest.mark.parametrize("seed", range(12))
 def test_matches_brute_force_tight_budget(seed):
     # Limit each read to one mismatch: exercises budget-constrained feasibility

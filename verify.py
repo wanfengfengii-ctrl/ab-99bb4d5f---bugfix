@@ -85,6 +85,27 @@ AMBIGUOUS_SAMPLE = {
     ],
 }
 
+# A read whose *cheaper* side is illegal under its mismatch budget: read 0
+# (110 on loci 0-2) would need 2 mismatches in group 0 (cost 1+1) but allows
+# only 1; the unique within-budget choice is group 1 with one mismatch at
+# locus 2 (cost 100).  Perfect anchors pin the pair to 00000000/11111111 and
+# force a balanced 5/5 split, so the costlier-but-feasible side is required.
+PREMIUM_BUDGET_SAMPLE = {
+    "loci": 8,
+    "reads": [
+        _read([0, 1, 2], "110", limit=1, costs=[1, 1, 100]),
+        _read([0, 1, 2, 3], "0000", limit=0),
+        _read([0, 1, 2, 3], "1111", limit=0),
+        _read([2, 3, 4, 5], "0000", limit=0),
+        _read([2, 3, 4, 5], "1111", limit=0),
+        _read([3, 4, 5, 6, 7], "00000", limit=0),
+        _read([3, 4, 5, 6, 7], "11111", limit=0),
+        _read([0, 1], "00", limit=0),
+        _read([6, 7], "11", limit=0),
+        _read([4, 5], "00", limit=0),
+    ],
+}
+
 
 def _gapped_sample():
     payload = json.loads(json.dumps(MISMATCH_SAMPLE))
@@ -165,6 +186,28 @@ def run_smoke(base_url):
             and all(s >= 2 for s in sol["group_sizes"])
         )
     results.append(_check("unique optimum, cost 1, one mismatch at locus 1",
+                          ok, f"status={status} body={body if status != 200 else body.get('objective')}"))
+
+    print("- sample where only the costlier side keeps the mismatch budget")
+    status, body = _request(base_url, "/api/phase", PREMIUM_BUDGET_SAMPLE)
+    ok = False
+    if status == 200:
+        sol = body["solutions"][0]
+        ev0 = sol["assignments"][0]
+        groups = [a["group"] for a in sol["assignments"]]
+        ok = (
+            body["status"] == "unique"
+            and sol["haplotypes"] == {"group_0": "00000000", "group_1": "11111111"}
+            and groups == [1, 0, 1, 0, 1, 0, 1, 0, 1, 0]
+            and sol["group_sizes"] == [5, 5]
+            and body["objective"] == {"total_mismatch_cost": 100,
+                                      "max_mismatches_per_read": 1}
+            and ev0["group"] == 1 and ev0["mismatch_count"] == 1
+            and ev0["mismatch_cost"] == 100 and ev0["within_mismatch_limit"]
+            and ev0["mismatches"] == [
+                {"position": 2, "observed": "0", "expected": "1", "cost": 100}]
+        )
+    results.append(_check("unique optimum at cost 100 via the premium side",
                           ok, f"status={status} body={body if status != 200 else body.get('objective')}"))
 
     print("- ambiguous sample (two distinct optima)")
