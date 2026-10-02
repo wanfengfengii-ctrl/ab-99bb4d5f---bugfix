@@ -1,0 +1,34 @@
+services:
+  api:
+    build: .
+    image: ancient-dna-phasing:latest
+    container_name: phasing-api
+    ports:
+      # Host-side port is configured through API_PORT (defaults to 8000).
+      - "${API_PORT:-8000}:8000"
+    healthcheck:
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - "import urllib.request,sys; r=urllib.request.urlopen('http://localhost:8000/health',timeout=3); sys.exit(0 if r.status==200 else 1)"
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped
+
+  # One-shot verification: waits until `api` is healthy, re-checks the
+  # mismatch and ambiguity samples plus the unit-test suite, then exits.
+  # Run with:
+  #   docker compose --profile verify run --rm verify ; echo $?
+  verify:
+    profiles: ["verify"]
+    image: ancient-dna-phasing:latest
+    build: .
+    command: ["python", "verify.py", "http://api:8000"]
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      PYTHONUNBUFFERED: "1"
